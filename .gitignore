@@ -1,0 +1,25 @@
+# API Keys and Secrets (CRITICAL)
+.env
+
+# Python Virtual Environment
+venv/
+ENV/
+env/
+
+# Python Cache and Compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor Settings
+.vscode/
+.idea/
+*.swp
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
+
+# Image Uploads (Don't upload test images to GitHub)
+static/uploads/*
+!static/uploads/.gitkeep
