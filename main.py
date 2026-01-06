@@ -1,14 +1,15 @@
 import os
 import io
 import asyncio
+import requests
 from google import genai 
 from fastapi import FastAPI, UploadFile, Form
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from backboard import BackboardClient
 from PIL import Image
 from dotenv import load_dotenv
-from pydantic import ValidationError # <--- Important import
+from pydantic import ValidationError
 
 app = FastAPI()
 
@@ -45,26 +46,19 @@ async def startup():
     if not assistant_id:
         try:
             assistant = await bb_client.create_assistant(
-                name="SnapCal",
-                description="Calorie tracking assistant with Gemini Vision."
+                name="FoodCrawler",
+                description="Calorie tracking assistant with persistent memory."
             )
             assistant_id = assistant.assistant_id
-            print(f"✅ Backboard Assistant Created: {assistant_id}")
-            print(f"⚠️ ADD THIS TO .env: BACKBOARD_ASSISTANT_ID={assistant_id}")
+            print(f"✅ Assistant Created: {assistant_id}")
         except Exception as e:
             print(f"⚠️ Startup Warning: {e}")
-    else:
-        print(f"✅ Using Existing Assistant: {assistant_id}")
 
 async def get_or_create_thread():
-    # 1. First, check if we forced a visible website thread in .env
     forced_id = os.getenv("FORCE_THREAD_ID")
     if forced_id:
-        # This prints to console so you know it's working
-        print(f"🔗 Connecting to Website Dashboard Thread: {forced_id}")
         return forced_id
 
-    # 2. Otherwise, use the standard logic (invisible API threads)
     global latest_thread_id
     if latest_thread_id:
         return latest_thread_id
@@ -79,13 +73,10 @@ async def get_or_create_thread():
     return None
 
 # --------------------
-# 2. Log Meal (FIXED)
+# 2. Log Meal
 # --------------------
 @app.post("/log-meal")
-async def log_meal(
-    image: UploadFile,
-    meal: str = Form(...)
-):
+async def log_meal(image: UploadFile, meal: str = Form(...)):
     thread_id = await get_or_create_thread()
     
     # --- STEP A: GEMINI VISION ---
@@ -105,22 +96,19 @@ async def log_meal(
             model=MODEL_ID,
             contents=[gemini_prompt, pil_image]
         )
-        analysis_text = response.text
+        # This creates the variable that was missing!
+        analysis_text = response.text 
         print("✅ Gemini Analysis Complete.")
 
     except Exception as e:
         print(f"❌ Gemini Error: {e}")
         return {"error": str(e)}
 
-    # --- STEP B: BACKBOARD STORAGE ---
+    # --- STEP B: BACKBOARD STORAGE (FIXED) ---
     if thread_id:
         try:
             print("💾 Saving data to Backboard...")
-            storage_message = (
-                f"I just ate a meal labeled '{meal}'. "
-                f"Visual analysis data: {analysis_text}. "
-                "Please log this into my nutrition history."
-            )
+            storage_message = f"Logged meal '{meal}'. Analysis: {analysis_text}."
             
             await bb_client.add_message(
                 thread_id=thread_id,
@@ -130,111 +118,224 @@ async def log_meal(
             print("✅ Saved to Backboard history.")
 
         except ValidationError:
-            # IGNORE LIBRARY BUG
-            print("✅ Saved to Backboard history (Ignored library error).")
+            # Catch the library bug: The message SAVED, but return parsing failed.
+            print("✅ Saved to Backboard (Ignored library parsing error).")
             
         except Exception as e:
-            print(f"⚠️ Backboard Save Warning: {e}")
+            # This catches the 'analysis_text' not defined error if Step A fails
+            print(f"⚠️ Backboard Warning: {e}")
 
     return {"result": analysis_text}
 
 # --------------------
-# 3. Ask (COMPLETELY FIXED)
+# 3. Ask
 # --------------------
 @app.post("/ask")
 async def ask(question: str = Form(...)):
     thread_id = await get_or_create_thread()
     
-    if not thread_id:
-        return {"error": "No active conversation found."}
-
-    # 1. Send Message
     try:
         await bb_client.add_message(
             thread_id=thread_id,
             content=question,
-            # SWITCHING TO OPENAI GPT-4o
             llm_provider="openai",
             model_name="gpt-4o",
             memory="Auto"
         )
     except ValidationError:
-        # Expected error due to library bug. Proceed to polling.
+        # Ignore library response parsing error; the message was sent.
         pass
     except Exception as e:
-        return {"error": f"Send Failed: {str(e)}"}
+        return {"error": str(e)}
 
-    # 2. Poll for Answer
-    try:
-        # Wait up to 10 seconds for the AI to reply
-        for _ in range(5):
-            await asyncio.sleep(2)
-            data = await bb_client.get_thread(thread_id)
-            
-            if hasattr(data, 'messages'):
-                # Look for the latest message from the assistant
-                for msg in reversed(data.messages):
-                    if msg.role == "assistant":
-                        return {"answer": msg.content}
-                        
-    except Exception as e:
-        return {"error": f"Polling Failed: {str(e)}"}
+    # Wait for the AI's reply
+    for _ in range(5):
+        await asyncio.sleep(2)
+        data = await bb_client.get_thread(thread_id)
+        if hasattr(data, 'messages'):
+            for msg in reversed(data.messages):
+                if msg.role == "assistant":
+                    return {"answer": msg.content}
+    return {"error": "Timeout"}
 
-    return {"error": "Timeout - AI took too long to reply"}
-
-# --------------------
-# 4. Memory Viewer (Your Custom Dashboard)
-# --------------------
-@app.get("/dashboard")
-async def dashboard():
-    """Fetches real memory data from Backboard and displays it."""
+@app.post("/add-fact")
+async def add_fact(fact: str = Form(...)):
+    """Manually add a fact to the Assistant's long-term memory."""
     import requests
+    url = f"https://app.backboard.io/api/assistants/{EXISTING_ASSISTANT_ID}/memories"
+    headers = {
+        "X-API-Key": BACKBOARD_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {"content": fact}
     
-    # 1. Fetch Memories
-    memories = []
+    resp = requests.post(url, json=payload, headers=headers)
+    if resp.status_code == 201:
+        return {"status": "Memory added to the Hive Mind."}
+    return {"error": resp.text}
+
+# --------------------
+# 4. Memory Management (The Daemon Console)
+# --------------------
+@app.delete("/delete-memory/{memory_id}")
+async def delete_memory(memory_id: str):
+    """Purge a specific memory from the Hive Mind."""
+    url = f"https://app.backboard.io/api/assistants/{EXISTING_ASSISTANT_ID}/memories/{memory_id}"
+    headers = {"X-API-Key": BACKBOARD_API_KEY}
+    resp = requests.delete(url, headers=headers)
+    if resp.status_code == 200:
+        return {"status": "success"}
+    return JSONResponse(status_code=400, content={"error": "Failed to purge memory"})
+
+@app.post("/add-memory")
+async def add_memory_manually(content: str = Form(...)):
+    """Manually inject a fact into the Assistant's long-term memory."""
+    url = f"https://app.backboard.io/api/assistants/{EXISTING_ASSISTANT_ID}/memories"
+    headers = {
+        "X-API-Key": BACKBOARD_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "content": content,
+        "metadata": {"source": "manual_injection"}
+    }
+    
+    response = requests.post(url, json=payload, headers=headers)
+    
+    if response.status_code == 201:
+        return {"status": "Memory indexed successfully", "data": response.json()}
+    return {"error": response.text}
+
+def get_thread_details(t_id):
     try:
-        url = f"https://app.backboard.io/api/assistants/{EXISTING_ASSISTANT_ID}/memories"
+        url = f"https://app.backboard.io/api/threads/{t_id}"
         resp = requests.get(url, headers={"X-API-Key": BACKBOARD_API_KEY})
         if resp.status_code == 200:
-            data = resp.json()
-            # Handle the list vs dict format
-            raw_list = data.get("memories", []) if isinstance(data, dict) else data
-            
-            for m in raw_list:
-                # Extract text safely
-                if isinstance(m, dict):
-                    memories.append(m.get('memory') or m.get('content') or str(m))
-                else:
-                    memories.append(str(m))
-    except Exception as e:
-        memories = [f"Error fetching memories: {str(e)}"]
+            return resp.json().get("messages", [])
+    except: return []
+    return []
 
-    # 2. Simple HTML Display
-    html_content = f"""
+# --- HELPER to get a Label for the Thread ---
+# --- HELPER: FIXED STRING PARSING ---
+def get_thread_label(thread_data):
+    """Safely extracts a title from the thread messages."""
+    messages = thread_data.get("messages", [])
+    if not messages:
+        return "Empty Conversation"
+    
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            # Using simple 'in' check and split without complex escapes
+            if "labeled '" in content:
+                parts = content.split("labeled '")
+                if len(parts) > 1:
+                    meal_name = parts[1].split("'")[0]
+                    return f"Meal: {meal_name}"
+            return content[:25] + "..."
+            
+    return f"Thread {thread_data.get('thread_id', '???')[:5]}"
+
+@app.get("/dashboard")
+async def dashboard(thread_id: str = None, search: str = None):
+    """Gemini-style Dashboard with corrected syntax and Sidebar Search."""
+    threads_list = []
+    memories_data = []
+    active_messages = []
+
+    # 1. Fetch Threads
+    try:
+        t_url = "https://app.backboard.io/api/threads?limit=20"
+        t_resp = requests.get(t_url, headers={"X-API-Key": BACKBOARD_API_KEY})
+        if t_resp.status_code == 200:
+            threads_list = t_resp.json()
+    except: pass
+
+    # 2. Fetch Memories
+    try:
+        m_url = f"https://app.backboard.io/api/assistants/{EXISTING_ASSISTANT_ID}/memories"
+        m_resp = requests.get(m_url, headers={"X-API-Key": BACKBOARD_API_KEY})
+        if m_resp.status_code == 200:
+            memories_data = m_resp.json().get("memories", [])
+    except: pass
+
+    # 3. Get Active Messages
+    if thread_id:
+        active_messages = get_thread_details(thread_id)
+
+    # --- Construct Sidebar with Search Filter ---
+    sidebar_html = ""
+    for t in threads_list:
+        label = get_thread_label(t)
+        # Simple Search Filtering
+        if search and search.lower() not in label.lower():
+            continue
+            
+        is_active = "active" if thread_id == t["thread_id"] else ""
+        sidebar_html += f'<a href="/dashboard?thread_id={t["thread_id"]}" class="nav-item {is_active}">{label}</a>'
+
+    memories_html = "".join([
+        f'<div class="memory-card" id="mem-{m.get("id")}"><span>{m.get("content") or m.get("memory")}</span>'
+        f'<button onclick="purgeMemory(\'{m.get("id")}\')">×</button></div>' for m in memories_data
+    ])
+
+    chat_html = "".join([
+        f'<div class="msg {m["role"]}"><small>{m["role"].upper()}:</small><br>{m["content"]}</div>' 
+        for m in active_messages if m.get("content")
+    ]) if active_messages else "<p style='color:#555; text-align:center;'>Select a chat to view the analysis logs.</p>"
+
+    return HTMLResponse(content=f"""
     <html>
         <head>
-            <title>SnapCal Brain 🧠</title>
+            <title>FoodCrawler Console 🧠</title>
             <style>
-                body {{ font-family: sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }}
-                h1 {{ color: #2c3e50; }}
-                .memory-card {{
-                    background: #f8f9fa;
-                    border-left: 5px solid #2ecc71;
-                    padding: 15px;
-                    margin-bottom: 10px;
-                    border-radius: 4px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }}
+                body {{ background: #0a0a0a; color: #ccc; font-family: 'Inter', sans-serif; display: flex; margin: 0; height: 100vh; }}
+                .sidebar {{ width: 280px; background: #000; border-right: 1px solid #222; display: flex; flex-direction: column; padding: 20px; }}
+                .search-bar {{ background: #111; border: 1px solid #333; color: #fff; padding: 8px; border-radius: 5px; margin-bottom: 15px; width: 100%; }}
+                .nav-item {{ padding: 12px; border-radius: 8px; color: #888; text-decoration: none; margin-bottom: 8px; font-size: 14px; transition: 0.2s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }}
+                .nav-item:hover {{ background: #1a1a1a; color: #fff; }}
+                .nav-item.active {{ background: #ff3e3e22; color: #ff3e3e; border: 1px solid #ff3e3e; }}
+                .main {{ flex: 1; display: flex; flex-direction: column; overflow-y: auto; background: #0f0f0f; }}
+                .container {{ padding: 30px; max-width: 850px; margin: 0 auto; width: 100%; }}
+                .msg {{ padding: 20px; border-radius: 12px; margin-bottom: 20px; line-height: 1.6; max-width: 85%; font-size: 15px; }}
+                .user {{ background: #252525; align-self: flex-end; margin-left: auto; color: #fff; }}
+                .assistant {{ background: #151515; border: 1px solid #252525; }}
+                .hive-section {{ margin-top: 60px; padding-top: 30px; border-top: 1px solid #222; }}
+                .memory-card {{ background: #111; border: 1px solid #222; padding: 12px; margin-bottom: 10px; display: flex; justify-content: space-between; border-radius: 6px; }}
+                .memory-card button {{ background: none; border: none; color: #ff3e3e; cursor: pointer; font-size: 20px; }}
+                .inject-input {{ background: #000; border: 1px solid #333; color: #0f0; padding: 12px; width: 75%; border-radius: 6px; }}
             </style>
+            <script>
+                async function purgeMemory(id) {{ await fetch('/delete-memory/'+id, {{method:'DELETE'}}); location.reload(); }}
+                async function injectFact() {{
+                    const f = document.getElementById('factInput').value;
+                    const fd = new FormData(); fd.append('fact', f);
+                    await fetch('/add-fact', {{method:'POST', body:fd}}); location.reload();
+                }}
+                function filterSearch(val) {{
+                    window.location.href = "/dashboard?search=" + val;
+                }}
+            </script>
         </head>
         <body>
-            <h1>🧠 SnapCal Long-Term Memory</h1>
-            <p>This is what the AI has learned about you from your conversations:</p>
-            <hr>
-            {''.join([f'<div class="memory-card">{m}</div>' for m in memories])}
-            <br>
-            <a href="/">⬅️ Back to Tracker</a>
+            <div class="sidebar">
+                <h3 style="color: #ff3e3e; font-size: 12px; letter-spacing: 2px; margin-bottom: 10px;">HISTORY</h3>
+                <input type="text" class="search-bar" placeholder="Search meals..." onchange="filterSearch(this.value)" value="{search or ''}">
+                <div style="overflow-y: auto;">{sidebar_html}</div>
+            </div>
+            <div class="main">
+                <div class="container">
+                    <div id="chat-view" style="display: flex; flex-direction: column;">{chat_html}</div>
+                    <div class="hive-section">
+                        <h3 style="color: #ff3e3e;">🧠 HIVE_MIND</h3>
+                        <div style="margin-bottom: 25px;">
+                            <input type="text" id="factInput" class="inject-input" placeholder="Inject core fact...">
+                            <button onclick="injectFact()" style="background:#ff3e3e; color:#fff; border:none; padding:12px; border-radius:6px; cursor:pointer;">Inject</button>
+                        </div>
+                        {memories_html}
+                    </div>
+                </div>
+            </div>
         </body>
     </html>
-    """
-    return HTMLResponse(content=html_content)
+    """)
