@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SnapCal</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; }
+        
+        /* The Chat Container */
+        #chat-history {
+            border: 1px solid #ccc;
+            padding: 1rem;
+            height: 400px;
+            overflow-y: scroll;
+            background: #f9f9f9;
+            margin-bottom: 1rem;
+            border-radius: 8px;
+        }
+
+        /* Message Bubbles */
+        .message { margin-bottom: 1rem; padding: 0.8rem; border-radius: 8px; }
+        .user-msg { background-color: #e3f2fd; text-align: right; margin-left: 20%; }
+        .ai-msg { background-color: #fff; border: 1px solid #ddd; margin-right: 20%; white-space: pre-wrap; }
+
+        .controls { display: flex; gap: 1rem; flex-direction: column; }
+        input, button { padding: 0.5rem; font-size: 1rem; }
+        button { cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; }
+        button:hover { background-color: #0056b3; }
+        .loading { font-style: italic; color: #666; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <h1>SnapCal 📸</h1>
+    
+    <div id="chat-history">
+        <div class="message ai-msg">Hello! Upload a food photo to get started.</div>
+    </div>
+
+    <div class="controls">
+        <form id="uploadForm">
+            <input type="file" name="image" required>
+            <input type="text" name="meal" placeholder="What is this food?" required>
+            <button type="submit">Upload & Analyze</button>
+        </form>
+
+        <hr>
+
+        <form id="askForm">
+            <input type="text" name="question" placeholder="Ask a follow-up question..." required>
+            <button type="submit">Ask SnapCal</button>
+        </form>
+    </div>
+
+    <script>
+        const chatHistory = document.getElementById("chat-history");
+
+        // --- Helper Function: Add Message to Screen ---
+        function appendMessage(sender, text, isUser = false) {
+            const msgDiv = document.createElement("div");
+            msgDiv.classList.add("message");
+            msgDiv.classList.add(isUser ? "user-msg" : "ai-msg");
+            
+            // Format bold text (**text**) to HTML bold (<b>text</b>) for better reading
+            let formattedText = text.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
+            msgDiv.innerHTML = formattedText;
+            
+            chatHistory.appendChild(msgDiv);
+            chatHistory.scrollTop = chatHistory.scrollHeight; // Auto-scroll to bottom
+        }
+
+        // --- Handle Image Upload ---
+        document.getElementById("uploadForm").onsubmit = async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const mealName = formData.get("meal");
+
+            // Show user message immediately
+            appendMessage("You", `Uploaded: ${mealName}`, true);
+            appendMessage("AI", "<i>Analyzing image... please wait...</i>");
+
+            const response = await fetch("/log-meal", {
+                method: "POST",
+                body: formData
+            });
+            const data = await response.json();
+
+            // Remove the "Analyzing..." loading text (optional, but keeps it clean)
+            chatHistory.lastElementChild.remove();
+
+            if (data.result) {
+                appendMessage("AI", data.result);
+            } else {
+                appendMessage("AI", "Error: " + (data.error || "Unknown error"));
+            }
+        };
+
+        // --- Handle Asking Questions ---
+        document.getElementById("askForm").onsubmit = async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const question = formData.get("question");
+
+            // Show user message immediately
+            appendMessage("You", question, true);
+            appendMessage("AI", "<i>Thinking...</i>");
+
+            // Clear input
+            e.target.reset();
+
+            const response = await fetch("/ask", {
+                method: "POST",
+                body: formData
+            });
+            const data = await response.json();
+
+            // Remove "Thinking..."
+            chatHistory.lastElementChild.remove();
+
+            if (data.answer) {
+                appendMessage("AI", data.answer);
+            } else {
+                appendMessage("AI", "Error: " + (data.error || "Unknown error"));
+            }
+        };
+    </script>
+</body>
+</html>
